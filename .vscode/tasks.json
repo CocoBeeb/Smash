@@ -1,0 +1,27 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "Run exhaustive fighter tier simulation",
+			"type": "shell",
+			"command": "node",
+			"args": [
+				"/home/codespace/.copilot/session-state/53e2bfc1-24b0-4b6d-bd84-0422a0eec3fb/files/simulate-exhaustive-tiers.cjs"
+			],
+			"isBackground": true,
+			"problemMatcher": []
+		},
+		{
+			"label": "Start Smash Battleground online server",
+			"type": "shell",
+			"command": "npm",
+			"args": [
+				"start",
+				"--prefix",
+				"${workspaceFolder}/smiosh"
+			],
+			"isBackground": true,
+			"problemMatcher": []
+		}
+	]
+}

@@ -194,17 +194,22 @@ let gameRunning = false;
 let gameMode = 'two-player';
 let cpuFrame = 0;
 let onlineFrame = 0;
+let onlineInputTimer = null;
 const online = {
   socket: null,
   role: null,
+  playerId: null,
   roomCode: '',
   peerConnected: false,
   remoteFighterId: null,
   remoteReady: false,
-  remoteKeys: {}
+  remoteKeys: {},
+  remoteInputs: {},
+  members: []
 };
 let particles = [];
 let projectiles = [];
+let fighters = [];
 
 const EXTRA_FIGHTERS = (() => {
   const rows = [
@@ -656,7 +661,7 @@ CHARACTERS['space-dragon'] = {
   glyph: '🐉',
   width: 82,
   height: 88,
-  jumps: 2,
+  jumps: 4,
   color: '#4c1d95',
   accent: '#f97316',
   form: 'space-dragon',
@@ -676,6 +681,17 @@ CHARACTERS['space-dragon'] = {
 const CHARACTER_IDS = Object.keys(CHARACTERS);
 if (CHARACTER_IDS.length !== 215) {
   throw new Error(`Expected 215 fighters, found ${CHARACTER_IDS.length}`);
+}
+
+const ORIGINAL_AVERAGE_WEIGHT = CHARACTER_IDS.reduce(
+  (total, id) => total + (CHARACTERS[id].weight || 1),
+  0
+) / CHARACTER_IDS.length;
+const WEIGHT_SCALE = 0.5;
+for (const id of CHARACTER_IDS) {
+  const character = CHARACTERS[id];
+  character.weight = ORIGINAL_AVERAGE_WEIGHT +
+    ((character.weight || 1) - ORIGINAL_AVERAGE_WEIGHT) * WEIGHT_SCALE;
 }
 
 // Web Audio API Synthesizer
@@ -803,8 +819,11 @@ function makeFighter(x, y, dir, char) {
     storedCharge: 0,
     smashChargeFrames: 0,
     smashCharging: false,
+    projectileCooldown: 0,
     grabTarget: false,
+    grabTargetId: null,
     grabbedBy: false,
+    grabbedById: null,
     grabTicks: 0,
     grabEscape: 0,
     grabMashInputs: {}
@@ -822,6 +841,7 @@ function getStageSpawnPoints() {
 const initialSpawns = getStageSpawnPoints();
 let p1 = makeFighter(initialSpawns[0].x, initialSpawns[0].y, 1, 'jigglypuff');
 let p2 = makeFighter(initialSpawns[1].x, initialSpawns[1].y, -1, 'steve');
+fighters = [p1, p2];
 
 const TIER_ORDER = ['S', 'A', 'B', 'C', 'D', 'NEW'];
 const TIER_SIMULATION_MATCHES = 23008;
@@ -1082,6 +1102,8 @@ const label2 = document.querySelector('.hud-p2 .fighter-label');
 const avatar1 = document.querySelector('.hud-p1 .fighter-avatar');
 const avatar2 = document.querySelector('.hud-p2 .fighter-avatar');
 const banner = document.getElementById('match-banner');
+const arena = document.getElementById('arena');
+const multiplayerHud = document.getElementById('multiplayer-hud');
 const gfx = document.getElementById('gfx');
 const ctx = gfx.getContext('2d');
 const btnAudio = document.getElementById('btn-audio');
@@ -1110,9 +1132,14 @@ const onlineControls = document.getElementById('online-controls');
 const onlineHostControls = document.getElementById('online-host-controls');
 const onlineGuestControls = document.getElementById('online-guest-controls');
 const createOnlineRoom = document.getElementById('create-online-room');
+const onlinePlayerNameInput = document.getElementById('online-player-name');
 const onlineRoomCodeInput = document.getElementById('online-room-code');
+const onlineRoomCodeDisplay = document.getElementById('online-room-code-display');
 const joinOnlineRoom = document.getElementById('join-online-room');
 const onlineStatus = document.getElementById('online-status');
+const onlineMembersLabel = document.getElementById('online-members');
+const onlineFightLabel = document.getElementById('online-fight-label');
+const onlineFightToggle = document.getElementById('online-fight');
 const selectCpuFighter = document.getElementById('select-cpu-fighter');
 const p1Hint = document.getElementById('p1-hint');
 const p2Hint = document.getElementById('p2-hint');
@@ -1134,7 +1161,9 @@ let lastCursorPlayer = 'p1';
 
 function canEnterStageSelect() {
   if (gameMode === 'online-host') {
-    return playerLocked.p1 && online.peerConnected && online.remoteReady;
+    const activeMembers = online.members.filter((member) => member.fighting);
+    return activeMembers.length >= 2 &&
+      activeMembers.every((member) => member.ready && member.fighterId);
   }
   if (gameMode === 'online-guest') return false;
   return playerLocked.p1 &&
@@ -1156,6 +1185,11 @@ function setGameMode(mode) {
   onlineHostControls.hidden = mode !== 'online-host';
   onlineGuestControls.hidden = mode !== 'online-guest';
   onlineStatus.textContent = onlineMode ? 'Create or join a room to play online.' : '';
+  onlineMembersLabel.textContent = '';
+  onlineRoomCodeDisplay.textContent = '';
+  onlineRoomCodeDisplay.hidden = true;
+  onlineFightLabel.hidden = true;
+  onlineFightToggle.checked = true;
   characterSearch.disabled = onlineMode;
   if (onlineMode && characterSearch.value) {
     characterSearch.value = '';
@@ -1174,28 +1208,46 @@ function startNewMatch() {
   const fighter2 = visibleCharacterIds[cursorIndices.p2];
   if (!fighter1 || !fighter2) return;
   if (gameMode === 'online-host') {
+    const players = online.members
+      .filter((member) => member.fighting && member.ready && member.fighterId)
+      .map(({ id, name, fighterId }) => ({ id, name, fighterId }));
     const sent = sendOnlineMessage({
       type: 'start',
-      fighter1,
-      fighter2,
+      players,
       stageId: selectedStage.id
     });
     if (!sent) return;
+    beginMatch(players[0].fighterId, players[1].fighterId, selectedStage, players);
+    return;
   }
   beginMatch(fighter1, fighter2, selectedStage);
 }
 
-function beginMatch(fighter1, fighter2, stage) {
+function beginMatch(fighter1, fighter2, stage, participants = null) {
   selectedStage = stage;
   initAudio();
   musicStep = 0;
   cpuFrame = 0;
   onlineFrame = 0;
   online.remoteKeys = {};
+  online.remoteInputs = {};
   for (const key of Object.keys(keys)) keys[key] = false;
-  const [spawn1, spawn2] = getStageSpawnPoints();
-  p1 = makeFighter(spawn1.x, spawn1.y, 1, fighter1);
-  p2 = makeFighter(spawn2.x, spawn2.y, -1, fighter2);
+  const roster = participants || [
+    { id: 'local-p1', fighterId: fighter1 },
+    { id: 'local-p2', fighterId: fighter2 }
+  ];
+  const ground = selectedStage.ground;
+  fighters = roster.map((member, index) => {
+    const x = ground.x + ground.w * (index + 1) / (roster.length + 1) - 41;
+    const fighter = makeFighter(x, ground.y + 50, x < ground.x + ground.w / 2 ? 1 : -1, member.fighterId);
+    fighter.networkId = member.id;
+    fighter.playerNumber = index + 1;
+    fighter.playerName = member.name || '';
+    fighter.projectileCooldown = 0;
+    return fighter;
+  });
+  p1 = fighters[0];
+  p2 = fighters[1];
   label1.textContent = CHARACTERS[p1.char].name.toUpperCase();
   label2.textContent = CHARACTERS[p2.char].name.toUpperCase();
   p1Hint.textContent = gameMode === 'online-guest'
@@ -1204,9 +1256,11 @@ function beginMatch(fighter1, fighter2, stage) {
   p2Hint.textContent = gameMode === 'one-player'
     ? 'CPU · Tournament move-aware AI'
     : gameMode === 'online-host'
-      ? 'ONLINE · Opponent controls Player 2'
+      ? 'ONLINE · Multiplayer'
       : gameMode === 'online-guest'
-        ? 'IJKL/arrows · Right Shift jump · O attack · P + direction special · mash to escape grabs'
+        ? online.members.find((member) => member.id === online.playerId)?.fighting
+          ? 'ONLINE · WASD move · Space jump · F attack · G special'
+          : 'ONLINE · Spectating'
         : 'IJKL/arrows · I aim up · Right Shift jump · O attack · P + direction special · mash to escape grabs';
   setFighterAvatar(avatar1, p1.char);
   setFighterAvatar(avatar2, p2.char);
@@ -1216,13 +1270,16 @@ function beginMatch(fighter1, fighter2, stage) {
   particles = [];
   projectiles = [];
   gameRunning = true;
+  arena.classList.add('match-running');
+  arena.classList.toggle('multiplayer-match', online.role === 'host' || online.role === 'guest');
+  onlineFightToggle.disabled = gameMode === 'online-guest';
   characterSelect.hidden = true;
   stageSelectScreen.hidden = true;
   winScreen.hidden = true;
   updateStockUI();
 }
 
-function connectOnline(action, roomCode = '') {
+function connectOnline(action, roomCode = '', playerName = '') {
   if (online.socket && online.socket.readyState < WebSocket.CLOSING) {
     onlineStatus.textContent = 'Already connected to a room.';
     return;
@@ -1234,8 +1291,8 @@ function connectOnline(action, roomCode = '') {
 
   socket.addEventListener('open', () => {
     socket.send(JSON.stringify(action === 'create'
-      ? { type: 'create-room' }
-      : { type: 'join-room', roomCode }));
+      ? { type: 'create-room', name: playerName }
+      : { type: 'join-room', roomCode, name: playerName }));
   });
   socket.addEventListener('message', (event) => {
     let message;
@@ -1255,10 +1312,17 @@ function connectOnline(action, roomCode = '') {
     const hadJoinedRoom = Boolean(online.role);
     online.socket = null;
     online.role = null;
+    online.playerId = null;
     online.roomCode = '';
     online.peerConnected = false;
     online.remoteReady = false;
     online.remoteKeys = {};
+    online.remoteInputs = {};
+    online.members = [];
+    onlineRoomCodeDisplay.textContent = '';
+    onlineRoomCodeDisplay.hidden = true;
+    onlineFightLabel.hidden = true;
+    onlineFightToggle.disabled = false;
     if (gameRunning) {
       gameRunning = false;
       banner.textContent = 'Online connection lost.';
@@ -1270,15 +1334,29 @@ function connectOnline(action, roomCode = '') {
   });
 }
 
+function startOnlineInputHeartbeat() {
+  if (onlineInputTimer !== null) clearInterval(onlineInputTimer);
+  onlineInputTimer = setInterval(() => {
+    if (online.role === 'guest' && gameRunning) sendOnlineInput();
+  }, 50);
+}
+
 function disconnectOnline() {
   const socket = online.socket;
   online.socket = null;
   online.role = null;
+  online.playerId = null;
   online.roomCode = '';
   online.peerConnected = false;
   online.remoteFighterId = null;
   online.remoteReady = false;
   online.remoteKeys = {};
+  online.remoteInputs = {};
+  online.members = [];
+  onlineRoomCodeDisplay.textContent = '';
+  onlineRoomCodeDisplay.hidden = true;
+  onlineFightLabel.hidden = true;
+  onlineFightToggle.disabled = false;
   if (socket && socket.readyState < WebSocket.CLOSING) socket.close();
 }
 
@@ -1319,10 +1397,17 @@ function sendSelectionUpdate() {
   if (online.role === 'host') {
     const fighterId = visibleCharacterIds[cursorIndices.p1];
     if (fighterId) {
+      const hostMember = online.members.find((member) => member.id === 'host');
+      if (hostMember) {
+        hostMember.fighterId = fighterId;
+        hostMember.ready = playerLocked.p1;
+        hostMember.fighting = onlineFightToggle.checked;
+      }
       sendOnlineMessage({
         type: 'host-selection',
         fighterId,
-        ready: playerLocked.p1
+        ready: playerLocked.p1,
+        fighting: onlineFightToggle.checked
       });
     }
   } else if (online.role === 'guest') {
@@ -1331,7 +1416,8 @@ function sendSelectionUpdate() {
       sendOnlineMessage({
         type: 'selection',
         fighterId,
-        ready: playerLocked.p2
+        ready: playerLocked.p2,
+        fighting: onlineFightToggle.checked
       });
     }
   }
@@ -1350,7 +1436,18 @@ function handleOnlineMessage(message) {
   }
   if (message.type === 'created') {
     online.role = 'host';
+    online.playerId = 'host';
     online.roomCode = message.roomCode;
+    online.members = [{
+      id: 'host',
+      name: onlinePlayerNameInput.value.trim(),
+      fighterId: null,
+      ready: false,
+      fighting: true
+    }];
+    onlineRoomCodeDisplay.textContent = `Room code: ${message.roomCode}`;
+    onlineRoomCodeDisplay.hidden = false;
+    onlineFightLabel.hidden = false;
     onlineStatus.textContent = `Room ${message.roomCode} created. Share the code and choose your fighter.`;
     updateCharacterSelectUI();
     sendSelectionUpdate();
@@ -1358,60 +1455,77 @@ function handleOnlineMessage(message) {
   }
   if (message.type === 'joined') {
     online.role = 'guest';
+    online.playerId = message.playerId;
     online.roomCode = message.roomCode;
     online.peerConnected = true;
-    onlineStatus.textContent = `Joined room ${message.roomCode}. Choose your fighter.`;
+    online.members = Array.isArray(message.members) ? message.members : [];
+    onlineFightLabel.hidden = false;
+    onlineFightToggle.checked = !message.inProgress;
+    onlineFightToggle.disabled = Boolean(message.inProgress);
+    onlineStatus.textContent = message.inProgress
+      ? `Joined room ${message.roomCode}. Spectating until the next match.`
+      : `Joined room ${message.roomCode}. Choose a fighter or spectate.`;
     updateCharacterSelectUI();
     sendSelectionUpdate();
     return;
   }
-  if (message.type === 'peer-joined' && online.role === 'host') {
-    online.peerConnected = true;
-    onlineStatus.textContent = 'Opponent connected. Choose and lock your fighter.';
+  if (message.type === 'room-members') {
+    online.members = Array.isArray(message.members) ? message.members : [];
+    const connectedPlayerIds = new Set(online.members.map((member) => member.id));
+    for (const playerId of Object.keys(online.remoteInputs)) {
+      if (!connectedPlayerIds.has(playerId)) delete online.remoteInputs[playerId];
+    }
+    online.peerConnected = online.members.length > 1;
+    online.remoteReady = online.members.filter((member) => member.fighting)
+      .every((member) => member.ready);
+    const activeCount = online.members.filter((member) => member.fighting).length;
+    const spectators = online.members.length - activeCount;
+    onlineMembersLabel.textContent = `${activeCount} fighting · ${spectators} spectating` +
+      (online.role === 'host'
+        ? ` · ${online.members.map((member, index) => {
+          const name = member.fighterId && CHARACTERS[member.fighterId]
+            ? CHARACTERS[member.fighterId].name
+            : 'Choosing';
+          return `${member.name}: ${name} (${member.fighting ? 'fight' : 'spectate'})`;
+        }).join(' · ')}`
+        : '');
+    if (online.role === 'guest') {
+      const localMember = online.members.find((member) => member.id === online.playerId);
+      if (localMember) onlineFightToggle.checked = localMember.fighting;
+    }
+    if (online.role === 'host') {
+      onlineStatus.textContent = 'Room updated. Players may join the fight or spectate.';
+    }
     updateCharacterSelectUI();
-    sendSelectionUpdate();
     return;
   }
   if (message.type === 'peer-left') {
     online.peerConnected = false;
     online.remoteReady = false;
     online.remoteKeys = {};
+    online.remoteInputs = {};
     if (gameRunning) {
       gameRunning = false;
       banner.textContent = 'Opponent disconnected.';
     }
-    onlineStatus.textContent = 'Opponent disconnected from the room.';
-    updateCharacterSelectUI();
-    return;
-  }
-  if (message.type === 'selection' && online.role === 'host') {
-    setRemoteSelection(2, message.fighterId, message.ready);
-    onlineStatus.textContent = message.ready
-      ? 'Opponent is ready. Lock in your fighter to choose the stage.'
-      : 'Opponent is choosing a fighter.';
-    updateCharacterSelectUI();
-    return;
-  }
-  if (message.type === 'host-selection' && online.role === 'guest') {
-    setRemoteSelection(1, message.fighterId, message.ready);
-    onlineStatus.textContent = message.ready
-      ? 'Host is ready. Lock in your fighter to begin.'
-      : 'Host is choosing a fighter.';
+    onlineStatus.textContent = 'Room member disconnected.';
     updateCharacterSelectUI();
     return;
   }
   if (message.type === 'start' && online.role === 'guest') {
     const stage = STAGES.find((candidate) => candidate.id === message.stageId);
-    if (!CHARACTERS[message.fighter1] || !CHARACTERS[message.fighter2] || !stage) {
+    if (!Array.isArray(message.players) || message.players.length < 2 ||
+        message.players.some((player) => !CHARACTERS[player.fighterId] ||
+          typeof player.name !== 'string') || !stage) {
       onlineStatus.textContent = 'The host sent an invalid match setup.';
       return;
     }
     onlineStatus.textContent = 'Match starting...';
-    beginMatch(message.fighter1, message.fighter2, stage);
+    beginMatch(message.players[0].fighterId, message.players[1].fighterId, stage, message.players);
     return;
   }
   if (message.type === 'input' && online.role === 'host') {
-    online.remoteKeys = message.keys;
+    if (typeof message.playerId === 'string') online.remoteInputs[message.playerId] = message.keys;
     return;
   }
   if (message.type === 'state' && online.role === 'guest') {
@@ -1420,7 +1534,7 @@ function handleOnlineMessage(message) {
   }
   if (message.type === 'game-over' && online.role === 'guest' &&
       CHARACTERS[message.winner?.char] &&
-      (message.playerNumber === 1 || message.playerNumber === 2)) {
+      Number.isInteger(message.playerNumber) && message.playerNumber >= 1) {
     if (message.state) applyOnlineState(message.state);
     gameRunning = false;
     showWinScreen(message.winner, message.playerNumber);
@@ -1428,7 +1542,8 @@ function handleOnlineMessage(message) {
 }
 
 function applyOnlineState(state) {
-  if (!state || !CHARACTERS[state.p1?.char] || !CHARACTERS[state.p2?.char] ||
+  if (!state || !Array.isArray(state.fighters) || state.fighters.length < 2 ||
+      state.fighters.some((fighter) => !CHARACTERS[fighter.char]) ||
       !Array.isArray(state.projectiles) ||
       typeof state.gameRunning !== 'boolean') {
     onlineStatus.textContent = 'Received an invalid game-state update.';
@@ -1439,8 +1554,9 @@ function applyOnlineState(state) {
     onlineStatus.textContent = 'Received an unknown arena update.';
     return;
   }
-  p1 = state.p1;
-  p2 = state.p2;
+  fighters = state.fighters;
+  p1 = fighters[0];
+  p2 = fighters[1];
   projectiles = state.projectiles;
   particles = [];
   selectedStage = stage;
@@ -1451,25 +1567,16 @@ function applyOnlineState(state) {
 }
 
 function sendOnlineInput() {
-  if (gameMode !== 'online-guest' || !gameRunning) return;
+  if (online.role !== 'guest' || !gameRunning ||
+      !fighters.some((fighter) => fighter.networkId === online.playerId)) return;
   sendOnlineMessage({
     type: 'input',
     keys: {
-      j: Boolean(keys.j || keys.arrowleft),
-      l: Boolean(keys.l || keys.arrowright),
-      i: Boolean(keys.i || keys.arrowup),
-      k: Boolean(keys.k || keys.arrowdown),
-      o: Boolean(keys.o),
-      p: Boolean(keys.p),
-      rshift: Boolean(keys.rshift)
-    }
+      a: Boolean(keys.a), d: Boolean(keys.d), w: Boolean(keys.w), s: Boolean(keys.s),
+      f: Boolean(keys.f), g: Boolean(keys.g), space: Boolean(keys.space)
+    },
+    playerId: online.playerId
   });
-}
-
-function applyRemoteInput() {
-  for (const key of ['j', 'l', 'i', 'k', 'o', 'p', 'rshift']) {
-    keys[key] = Boolean(online.remoteKeys[key]);
-  }
 }
 
 function sendOnlineState() {
@@ -1477,8 +1584,7 @@ function sendOnlineState() {
   sendOnlineMessage({
     type: 'state',
     state: {
-      p1,
-      p2,
+      fighters,
       projectiles,
       stageId: selectedStage.id,
       gameRunning
@@ -1487,6 +1593,7 @@ function sendOnlineState() {
 }
 
 function populateCharacterSelect() {
+  onlineFightToggle.addEventListener('change', sendSelectionUpdate);
   characterSearch.addEventListener('input', () => {
     playerLocked.p1 = false;
     playerLocked.p2 = false;
@@ -1509,14 +1616,28 @@ function populateCharacterSelect() {
   for (const button of gameModeButtons) {
     button.addEventListener('click', () => setGameMode(button.dataset.gameMode));
   }
-  createOnlineRoom.addEventListener('click', () => connectOnline('create'));
+  createOnlineRoom.addEventListener('click', () => {
+    const name = onlinePlayerNameInput.value.trim();
+    if (!name || name.length > 16) {
+      onlineStatus.textContent = 'Enter a name between 1 and 16 characters.';
+      onlinePlayerNameInput.focus();
+      return;
+    }
+    connectOnline('create', '', name);
+  });
   joinOnlineRoom.addEventListener('click', () => {
+    const name = onlinePlayerNameInput.value.trim();
+    if (!name || name.length > 16) {
+      onlineStatus.textContent = 'Enter a name between 1 and 16 characters.';
+      onlinePlayerNameInput.focus();
+      return;
+    }
     const roomCode = onlineRoomCodeInput.value.trim().toUpperCase();
     if (!/^[ABCDEFGHJKLMNPQRSTUVWXYZ23456789]{8}$/.test(roomCode)) {
       onlineStatus.textContent = 'Enter the 8-character room code shared by the host.';
       return;
     }
-    connectOnline('join', roomCode);
+    connectOnline('join', roomCode, name);
   });
   onlineRoomCodeInput.addEventListener('input', () => {
     onlineRoomCodeInput.value = onlineRoomCodeInput.value
@@ -1954,6 +2075,9 @@ function handleCharacterSelectKeydown(event) {
 
 function returnToCharacterSelect() {
   gameRunning = false;
+  arena.classList.remove('match-running');
+  arena.classList.remove('multiplayer-match');
+  onlineFightToggle.disabled = false;
   winScreen.hidden = true;
   stageSelectScreen.hidden = true;
   characterSelect.hidden = false;
@@ -1976,8 +2100,7 @@ function showWinScreen(winner, playerNumber) {
       winner: { char: winner.char },
       playerNumber,
       state: {
-        p1,
-        p2,
+        fighters,
         projectiles,
         stageId: selectedStage.id,
         gameRunning: false
@@ -2015,8 +2138,29 @@ btnAudio.addEventListener('click', () => {
 });
 
 function updateStockUI() {
-  stocks1.innerHTML = stockIcons(p1);
-  stocks2.innerHTML = stockIcons(p2);
+  stocks1.innerHTML = p1 ? stockIcons(p1) : '';
+  stocks2.innerHTML = p2 ? stockIcons(p2) : '';
+  const onlineMatch = online.role === 'host' || online.role === 'guest';
+  multiplayerHud.replaceChildren(...(onlineMatch ? fighters : []).map((fighter, index) => {
+    const card = document.createElement('div');
+    card.className = 'multiplayer-player';
+    card.classList.toggle('is-eliminated', fighter.action === 'eliminated');
+
+    const title = document.createElement('span');
+    title.className = 'multiplayer-player-name';
+    title.textContent = `P${index + 1} ${fighter.playerName || CHARACTERS[fighter.char].name}`;
+
+    const damage = document.createElement('span');
+    damage.className = 'multiplayer-player-damage';
+    damage.textContent = `${Math.round(fighter.percent)}%`;
+
+    const stocks = document.createElement('span');
+    stocks.className = 'multiplayer-player-stocks';
+    stocks.textContent = `${fighter.stocks} stocks`;
+
+    card.append(title, damage, stocks);
+    return card;
+  }));
 }
 
 function stockIcons(fighter) {
@@ -3005,42 +3149,63 @@ function chooseCpuInput(fighter, opponent, frame, isP1 = false) {
   return keysForFighter;
 }
 
-function handleInput(p, isP1) {
-  const left = isP1 ? keys['a'] : (keys['j'] || keys['arrowleft']);
-  const right = isP1 ? keys['d'] : (keys['l'] || keys['arrowright']);
-  const up = isP1 ? keys['w'] : (keys['i'] || keys['arrowup']);
-  const jump = isP1 ? keys.space : keys.rshift || keys.jump;
-  const down = isP1 ? keys['s'] : (keys['k'] || keys['arrowdown']);
-  const atk = isP1 ? keys['f'] : (keys['o'] || keys['1'] || keys['numpad1']);
-  const spc = isP1 ? keys['g'] : (keys['p'] || keys['2'] || keys['numpad2']);
+function handleInput(p, isP1, inputState = keys) {
+  const onlineKeys = inputState;
+  if (p.projectileCooldown > 0) p.projectileCooldown--;
+  const universalOnlineControls = online.role === 'host' || online.role === 'guest';
+  const left = universalOnlineControls
+    ? onlineKeys.a
+    : isP1 ? keys.a : (keys.j || keys.arrowleft);
+  const right = universalOnlineControls
+    ? onlineKeys.d
+    : isP1 ? keys.d : (keys.l || keys.arrowright);
+  const up = universalOnlineControls
+    ? onlineKeys.w
+    : isP1 ? keys.w : (keys.i || keys.arrowup);
+  const jump = universalOnlineControls
+    ? onlineKeys.space
+    : isP1 ? keys.space : keys.rshift || keys.jump;
+  const down = universalOnlineControls
+    ? onlineKeys.s
+    : isP1 ? keys.s : (keys.k || keys.arrowdown);
+  const atk = universalOnlineControls
+    ? onlineKeys.f
+    : isP1 ? keys.f : (keys.o || keys['1'] || keys.numpad1);
+  const spc = universalOnlineControls
+    ? onlineKeys.g
+    : isP1 ? keys.g : (keys.p || keys['2'] || keys.numpad2);
 
   if (p.action === 'grabbed') {
-    const mashKeys = isP1
+    const mashKeys = universalOnlineControls || isP1
       ? ['a', 'd', 'w', 's', 'space', 'f', 'g']
       : ['j', 'l', 'i', 'k', 'arrowleft', 'arrowright', 'arrowup', 'arrowdown',
           'rshift', 'jump', 'o', 'p', '1', 'numpad1', '2', 'numpad2'];
     let newMashPress = false;
     for (const key of mashKeys) {
-      if (keys[key] && !p.grabMashInputs[key]) newMashPress = true;
-      p.grabMashInputs[key] = Boolean(keys[key]);
+      const pressed = universalOnlineControls ? onlineKeys[key] : keys[key];
+      if (pressed && !p.grabMashInputs[key]) newMashPress = true;
+      p.grabMashInputs[key] = Boolean(pressed);
     }
     if (newMashPress) p.grabEscape++;
-    if (p.grabEscape >= 8) escapeGrapple(isP1 ? p2 : p1, p);
+    if (p.grabEscape >= 8) {
+      const grabber = fighters.find((fighter) => fighter.networkId === p.grabbedById);
+      if (grabber) escapeGrapple(grabber, p);
+    }
     return;
   }
 
   // Cannot move/attack during hitstun
-  if (p.action === 'hitstun') return;
+  if (p.action === 'hitstun' || p.action === 'eliminated') return;
 
   const boost = p.powerBoost > 0 ? 1.18 : 1;
   const accel = (p.onGround ? 0.8 : 0.45) * p.speed * boost;
   const maxSpeed = (p.onGround ? 5.5 : 4.5) * p.speed * boost;
   if (left) {
     p.vx = Math.max(p.vx - accel, -maxSpeed);
-    if (p.action === 'idle' || p.action === 'grabbing') p.facing = -1;
+    if ((p.action === 'idle' || p.action === 'grabbing') && !p.grabTarget) p.facing = -1;
   } else if (right) {
     p.vx = Math.min(p.vx + accel, maxSpeed);
-    if (p.action === 'idle' || p.action === 'grabbing') p.facing = 1;
+    if ((p.action === 'idle' || p.action === 'grabbing') && !p.grabTarget) p.facing = 1;
   } else if (p.onGround) {
     p.vx *= 0.82;
   } else {
@@ -3059,7 +3224,10 @@ function handleInput(p, isP1) {
 
   const dir = up ? 'up' : down ? 'down' : (left || right) ? 'side' : 'neutral';
   if (p.grabTarget) {
-    if (spc && !p.specialLock) releaseGrapple(p, isP1 ? p2 : p1);
+    if (spc && !p.specialLock) {
+      const target = fighters.find((fighter) => fighter.networkId === p.grabTargetId);
+      if (target) releaseGrapple(p, target);
+    }
     if (!spc) p.specialLock = false;
     return;
   }
@@ -3106,6 +3274,12 @@ function handleInput(p, isP1) {
       attack.endlag += 6;
     }
     p.attack = prepareDirectionalAttack(p, dir, attack, false);
+    if (p.attack.isProjectile && p.projectileCooldown > 0) {
+      p.attack = null;
+      p.attackLock = true;
+      return;
+    }
+    if (p.attack.isProjectile) p.projectileCooldown = 38;
     p.action = 'startup';
     p.attackFrame = p.attack.startup;
     p.hasHit = false;
@@ -3132,6 +3306,12 @@ function handleInput(p, isP1) {
       attack.startup = Math.max(1, attack.startup - 1);
       attack.endlag = Math.max(4, attack.endlag - 3);
       p.attack = prepareDirectionalAttack(p, dir, attack, false);
+      if (p.attack.isProjectile && p.projectileCooldown > 0) {
+        p.attack = null;
+        p.attackLock = true;
+        return;
+      }
+      if (p.attack.isProjectile) p.projectileCooldown = 38;
       p.action = 'startup';
       p.attackFrame = p.attack.startup;
       p.hasHit = false;
@@ -3141,8 +3321,16 @@ function handleInput(p, isP1) {
         p.chargeFrames = 1;
         p.specialLock = true;
       } else {
+        const previousVelocity = { vx: p.vx, vy: p.vy };
         const attack = prepareDirectionalAttack(p, dir, executeSpecial(p, dir), true);
+        if (attack.isProjectile && p.projectileCooldown > 0) {
+          p.vx = previousVelocity.vx;
+          p.vy = previousVelocity.vy;
+          p.specialLock = true;
+          return;
+        }
         if (CHARACTERS[p.char].combatKit === 'sam' && dir === 'neutral') p.storedCharge = 0;
+        if (attack.isProjectile) p.projectileCooldown = 38;
         p.attack = attack;
         p.action = 'startup';
         p.attackFrame = p.attack.startup;
@@ -3184,10 +3372,12 @@ function releaseGrapple(p, target) {
   target.vx = p.facing * (14 + Math.min(4, p.grabTicks / 20)) * scale / target.weight;
   target.vy = (7 + Math.min(3, p.grabTicks / 30)) * scale / target.weight;
   target.grabbedBy = false;
+  target.grabbedById = null;
   target.grabEscape = 0;
   target.grabMashInputs = {};
   applyHitstun(target, 24);
   p.grabTarget = false;
+  p.grabTargetId = null;
   p.grabTicks = 0;
   p.action = 'idle';
   p.attack = null;
@@ -3202,6 +3392,7 @@ function releaseGrapple(p, target) {
 function escapeGrapple(p, target) {
   if (!p.grabTarget || !target.grabbedBy) return;
   target.grabbedBy = false;
+  target.grabbedById = null;
   target.grabEscape = 0;
   target.grabMashInputs = {};
   target.action = 'idle';
@@ -3211,6 +3402,7 @@ function escapeGrapple(p, target) {
   target.vx = -p.facing * 3.5 / target.weight;
   target.vy = 2.5 / target.weight;
   p.grabTarget = false;
+  p.grabTargetId = null;
   p.grabTicks = 0;
   p.action = 'idle';
   p.attack = null;
@@ -3224,8 +3416,10 @@ function escapeGrapple(p, target) {
 function cancelGrapple(p, target) {
   if (p.grabTarget || target.grabbedBy) {
     p.grabTarget = false;
+    p.grabTargetId = null;
     p.grabTicks = 0;
     target.grabbedBy = false;
+    target.grabbedById = null;
     target.grabEscape = 0;
     target.grabMashInputs = {};
     if (p.action === 'grabbing') {
@@ -3243,7 +3437,9 @@ function cancelGrapple(p, target) {
   }
   if (p.grabbedBy || target.grabTarget) {
     p.grabbedBy = false;
+    p.grabbedById = null;
     target.grabTarget = false;
+    target.grabTargetId = null;
     target.grabTicks = 0;
     if (p.action === 'grabbed') {
       p.action = 'idle';
@@ -3260,8 +3456,16 @@ function cancelGrapple(p, target) {
   }
 }
 
-function updateGrapple(p, target) {
+function updateGrapple(p) {
   if (!p.grabTarget) return;
+  const target = fighters.find((fighter) => fighter.networkId === p.grabTargetId);
+  if (!target) {
+    p.grabTarget = false;
+    p.grabTargetId = null;
+    p.grabTicks = 0;
+    p.action = 'idle';
+    return;
+  }
   if (!target.grabbedBy || p.action !== 'grabbing' || target.action !== 'grabbed') {
     cancelGrapple(p, target);
     return;
@@ -3282,6 +3486,8 @@ function updateGrapple(p, target) {
   const nextX = p.x + p.facing * carrySpeed;
   if (nextX < ground.x || nextX + pDim.w > ground.x + ground.w) {
     p.vx = 0;
+    releaseGrapple(p, target);
+    return;
   } else {
     p.vx = p.facing * carrySpeed;
   }
@@ -3307,6 +3513,7 @@ function updatePhysics(p) {
     if (p.invincible > 0) p.invincible--;
     return;
   }
+  if (p.action === 'eliminated') return;
 
   p.x += p.vx;
   p.y += p.vy;
@@ -3335,7 +3542,7 @@ function updatePhysics(p) {
   if (p.invincible > 0) p.invincible--;
 }
 
-function handleCombat(p, opp) {
+function handleCombat(p, opponents) {
   if (!p.attack) return;
   p.attackFrame--;
 
@@ -3357,80 +3564,90 @@ function handleCombat(p, opp) {
         p.hasHit = true;
         launchProjectile(p, p.attack);
       } else {
+        const targets = (Array.isArray(opponents) ? opponents : [opponents])
+          .filter((target) => target && target !== p && target.action !== 'eliminated');
         const pDim = getFighterDim(p);
-        const oDim = getFighterDim(opp);
         const hitbox = p.attack.hitbox || { x: p.attack.isRest ? 48 : p.attack.reach || 82, y: 82, offsetX: p.facing * 24, offsetY: 0 };
         const hitCenterX = p.x + pDim.w / 2 + hitbox.offsetX;
         const hitCenterY = p.y + pDim.h / 2 + hitbox.offsetY;
-        const overlapsTarget =
-          hitCenterX + hitbox.x >= opp.x &&
-          hitCenterX - hitbox.x <= opp.x + oDim.w &&
-          hitCenterY + hitbox.y >= opp.y &&
-          hitCenterY - hitbox.y <= opp.y + oDim.h;
+        const overlappingTargets = targets.filter((target) => {
+          const targetDim = getFighterDim(target);
+          return target.invincible <= 0 &&
+            hitCenterX + hitbox.x >= target.x &&
+            hitCenterX - hitbox.x <= target.x + targetDim.w &&
+            hitCenterY + hitbox.y >= target.y &&
+            hitCenterY - hitbox.y <= target.y + targetDim.h;
+        });
 
-        if (overlapsTarget && opp.invincible <= 0) {
+        if (overlappingTargets.length > 0) {
           p.hasHit = true;
           const atk = p.attack;
           if (atk.isMultiHit) atk.hitCount = (atk.hitCount || 0) + 1;
-          if (opp.guard > 0) {
-            const counterDamage = opp.guardCounterDamage || opp.attack?.counterDamage || 0;
-            opp.guard = 0;
-            opp.guardCounterDamage = 0;
-            opp.vx = -p.facing * 6 / opp.weight;
-            opp.vy = 5 / opp.weight;
-            applyHitstun(opp, getHitstunFrames(atk, atk.dmg * 0.35));
-            if (counterDamage > 0) {
-              p.percent += counterDamage;
-              p.vx = -opp.facing * (5 + counterDamage * 0.35) / p.weight;
-              p.vy = (3 + counterDamage * 0.25) / p.weight;
-              applyHitstun(p, 8 + counterDamage);
-            }
-            spawnVFX(opp.x + oDim.w / 2, opp.y + oDim.h / 2, 'ring', CHARACTERS[opp.char].accent, 32);
-            playSound('hit');
-          } else if (atk.isSing) {
-            applyHitstun(opp, atk.hitstun);
-            playSound('hit');
-            spawnVFX(opp.x + 20, opp.y + 30, 'ring', '#38bdf8', 32);
-          } else if (atk.isRest) {
-            opp.percent += atk.dmg;
-            const scale = 1.1 + (opp.percent / 100) * 1.1;
-            opp.vx = p.facing * atk.kbx * scale / opp.weight;
-            opp.vy = atk.kby * scale / opp.weight;
-            applyHitstun(opp, getHitstunFrames(atk));
-            playSound('rest');
-            spawnVFX(opp.x + 26, opp.y + 30, 'burst', '#fef08a', 44);
-          } else {
-            const damage = p.powerBoost > 0 ? atk.dmg * 1.2 : atk.dmg;
-            opp.percent += damage;
-            const scale = 0.55 + (opp.percent / 100) * 0.65;
-            if (atk.carryTarget) {
-              p.grabTarget = true;
-              p.grabTicks = 0;
-              p.action = 'grabbing';
-              p.attackFrame = 0;
-              p.hasHit = false;
-              opp.grabbedBy = true;
-              opp.grabEscape = 0;
-              opp.grabMashInputs = {};
-              opp.action = 'grabbed';
-              opp.attack = null;
-              opp.attackFrame = 0;
-              opp.hasHit = false;
-              opp.vx = 0;
-              opp.vy = 0;
+          const hitTargets = atk.carryTarget ? overlappingTargets.slice(0, 1) : overlappingTargets;
+          for (const opp of hitTargets) {
+            const oDim = getFighterDim(opp);
+            if (opp.guard > 0) {
+              const counterDamage = opp.guardCounterDamage || opp.attack?.counterDamage || 0;
+              opp.guard = 0;
+              opp.guardCounterDamage = 0;
+              opp.vx = -p.facing * 6 / opp.weight;
+              opp.vy = 5 / opp.weight;
+              applyHitstun(opp, getHitstunFrames(atk, atk.dmg * 0.35));
+              if (counterDamage > 0) {
+                p.percent += counterDamage;
+                p.vx = -opp.facing * (5 + counterDamage * 0.35) / p.weight;
+                p.vy = (3 + counterDamage * 0.25) / p.weight;
+                applyHitstun(p, 8 + counterDamage);
+              }
+              spawnVFX(opp.x + oDim.w / 2, opp.y + oDim.h / 2, 'ring', CHARACTERS[opp.char].accent, 32);
               playSound('hit');
-              spawnVFX(opp.x + oDim.w / 2, opp.y + oDim.h / 2, 'burst', atk.color || '#f43f5e', 22);
-              return;
-            } else if (atk.pullTarget) {
-              opp.vx = (p.x - opp.x) * 0.08 / opp.weight;
-              opp.vy = Math.max(2, atk.kby * scale) / opp.weight;
-            } else {
+            } else if (atk.isSing) {
+              applyHitstun(opp, atk.hitstun);
+              playSound('hit');
+              spawnVFX(opp.x + 20, opp.y + 30, 'ring', '#38bdf8', 32);
+            } else if (atk.isRest) {
+              opp.percent += atk.dmg;
+              const scale = 1.1 + (opp.percent / 100) * 1.1;
               opp.vx = p.facing * atk.kbx * scale / opp.weight;
               opp.vy = atk.kby * scale / opp.weight;
+              applyHitstun(opp, getHitstunFrames(atk));
+              playSound('rest');
+              spawnVFX(opp.x + 26, opp.y + 30, 'burst', '#fef08a', 44);
+            } else {
+              const damage = p.powerBoost > 0 ? atk.dmg * 1.2 : atk.dmg;
+              opp.percent += damage;
+              const scale = 0.55 + (opp.percent / 100) * 0.65;
+              if (atk.carryTarget) {
+                p.grabTarget = true;
+                p.grabTargetId = opp.networkId;
+                p.grabTicks = 0;
+                p.action = 'grabbing';
+                p.attackFrame = 0;
+                p.hasHit = false;
+                opp.grabbedBy = true;
+                opp.grabbedById = p.networkId;
+                opp.grabEscape = 0;
+                opp.grabMashInputs = {};
+                opp.action = 'grabbed';
+                opp.attack = null;
+                opp.attackFrame = 0;
+                opp.hasHit = false;
+                opp.vx = 0;
+                opp.vy = 0;
+                playSound('hit');
+                spawnVFX(opp.x + oDim.w / 2, opp.y + oDim.h / 2, 'burst', atk.color || '#f43f5e', 22);
+                return;
+              } else if (atk.pullTarget) {
+                opp.vx = (p.x - opp.x) * 0.08 / opp.weight;
+                opp.vy = Math.max(2, atk.kby * scale) / opp.weight;
+              } else {
+                opp.vx = p.facing * atk.kbx * scale / opp.weight;
+                opp.vy = atk.kby * scale / opp.weight;
+              }
+              applyHitstun(opp, getHitstunFrames(atk, damage));
+              playSound('hit');
+              spawnVFX(opp.x + 26, opp.y + 30, 'burst', atk.color || '#f43f5e', 22);
             }
-            applyHitstun(opp, getHitstunFrames(atk, damage));
-            playSound('hit');
-            spawnVFX(opp.x + 26, opp.y + 30, 'burst', atk.color || '#f43f5e', 22);
           }
         }
       }
@@ -3545,7 +3762,7 @@ function tryPickupGyro(projectile, picker = null) {
   }
   let closestFighter = null;
   let closestDistance = Infinity;
-  for (const fighter of picker ? [picker] : [p1, p2]) {
+  for (const fighter of picker ? [picker] : fighters) {
     const dim = getFighterDim(fighter);
     const centerX = fighter.x + dim.w / 2;
     const dx = projectile.x - centerX;
@@ -3594,7 +3811,14 @@ function updateProjectiles() {
     if (projectile.hitByAttackCooldown > 0) projectile.hitByAttackCooldown--;
     const previousY = projectile.y;
     if (projectile.isHoming) {
-      const target = projectile.owner === p1 ? p2 : p1;
+      const target = fighters
+        .filter((fighter) => fighter !== projectile.owner && fighter.action !== 'eliminated')
+        .sort((a, b) => {
+          const da = (a.x - projectile.x) ** 2 + (a.y - projectile.y) ** 2;
+          const db = (b.x - projectile.x) ** 2 + (b.y - projectile.y) ** 2;
+          return da - db;
+        })[0];
+      if (!target) continue;
       const targetDim = getFighterDim(target);
       const targetX = target.x + targetDim.w / 2;
       const targetY = target.y + targetDim.h / 2;
@@ -3657,9 +3881,8 @@ function updateProjectiles() {
     if (projectile.hitCooldown <= 0) projectile.lastHitTarget = null;
     if (tryPickupGyro(projectile)) continue;
 
-    const targets = projectile.isGyro
-      ? [p1, p2]
-      : [projectile.owner === p1 ? p2 : p1];
+    const targets = (projectile.isGyro ? fighters : fighters.filter((fighter) => fighter !== projectile.owner))
+      .filter((fighter) => fighter.action !== 'eliminated');
     let hitTarget = false;
     for (const target of targets) {
       const dim = getFighterDim(target);
@@ -3708,33 +3931,46 @@ function updateProjectiles() {
   }
 }
 
-function checkBlastZones(p, isP1) {
-  if (!gameRunning) return;
+function checkBlastZones(p, fighterIndex) {
+  if (!gameRunning || p.action === 'eliminated') return;
   if (p.x < -100 || p.x > ARENA_W + 100 || p.y < -150 || p.y > ARENA_H + 200) {
-    cancelGrapple(p, isP1 ? p2 : p1);
+    const grabber = fighters.find((fighter) => fighter.networkId === p.grabbedById);
+    const grabbedTarget = fighters.find((fighter) => fighter.networkId === p.grabTargetId);
+    if (grabber) cancelGrapple(grabber, p);
+    if (grabbedTarget) cancelGrapple(p, grabbedTarget);
     p.stocks--;
     playSound('ko');
     updateStockUI();
     spawnVFX(Math.max(50, Math.min(ARENA_W - 50, p.x)), Math.max(50, p.y), 'burst', '#fbbf24', 40);
     if (p.stocks <= 0) {
-      gameRunning = false;
-      showWinScreen(isP1 ? p2 : p1, isP1 ? 2 : 1);
+      p.action = 'eliminated';
+      p.vx = 0;
+      p.vy = 0;
+      const survivors = fighters.filter((fighter) => fighter.stocks > 0);
+      if (survivors.length <= 1) {
+        gameRunning = false;
+        const winner = survivors[0] || fighters.find((fighter) => fighter !== p) || p;
+        showWinScreen(winner, fighters.indexOf(winner) + 1);
+      }
     } else {
-      const spawn = getStageSpawnPoints()[isP1 ? 0 : 1];
-      p.x = spawn.x;
-      p.y = spawn.y;
+      const ground = selectedStage.ground;
+      p.x = ground.x + ground.w * (fighterIndex + 1) / (fighters.length + 1) - getFighterDim(p).w / 2;
+      p.y = ground.y + 50;
       p.vx = 0;
       p.vy = 0;
       p.percent = 0;
       p.action = 'idle';
       p.attack = null;
       p.grabTarget = false;
+      p.grabTargetId = null;
       p.grabbedBy = false;
+      p.grabbedById = null;
       p.grabTicks = 0;
       p.chargeFrames = 0;
       p.storedCharge = 0;
       p.smashCharging = false;
       p.smashChargeFrames = 0;
+      p.projectileCooldown = 0;
       p.invincible = 90;
     }
   }
@@ -5669,6 +5905,25 @@ function drawFighter(f) {
     ctx.stroke();
   }
   ctx.restore();
+
+  if (f.playerName) {
+    ctx.save();
+    const name = `#${f.playerNumber} ${f.playerName}`;
+    const centerX = f.x + dim.w / 2;
+    const labelY = Math.max(12, screenY - dim.h - 10);
+    ctx.font = '700 14px system-ui, sans-serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    const labelWidth = Math.min(190, ctx.measureText(name).width + 14);
+    ctx.fillStyle = 'rgba(15, 23, 42, 0.9)';
+    ctx.fillRect(centerX - labelWidth / 2, labelY - 10, labelWidth, 20);
+    ctx.strokeStyle = CHARACTERS[f.char].accent;
+    ctx.lineWidth = 2;
+    ctx.strokeRect(centerX - labelWidth / 2, labelY - 10, labelWidth, 20);
+    ctx.fillStyle = '#fff';
+    ctx.fillText(name, centerX, labelY, labelWidth - 8);
+    ctx.restore();
+  }
 }
 
 function drawStage() {
@@ -5830,33 +6085,41 @@ function render() {
     if (p.life <= 0) particles.splice(i, 1);
   }
 
-  drawFighter(p1);
   drawProjectiles();
-  drawFighter(p2);
+  for (const fighter of fighters) drawFighter(fighter);
 }
 
 function gameLoop() {
-  if (gameRunning && gameMode !== 'online-guest') {
-    handleInput(p1, true);
-    if (gameMode === 'one-player') {
+  if (gameRunning && online.role !== 'guest') {
+    if (online.role === 'host') {
+      for (const fighter of fighters) {
+        const fighterKeys = fighter.networkId === 'host'
+          ? keys
+          : online.remoteInputs[fighter.networkId] || {};
+        handleInput(fighter, false, fighterKeys);
+      }
+    } else {
+      handleInput(p1, true);
+    }
+    if (online.role === null && gameMode === 'one-player') {
       for (const key of ['j', 'l', 'i', 'k', 'o', 'p', 'jump']) keys[key] = false;
       const cpuInput = chooseCpuInput(p2, p1, cpuFrame++);
       constrainCpuMovement(p2, cpuInput);
       Object.assign(keys, cpuInput);
+      handleInput(p2, false);
+    } else if (online.role === null && gameMode === 'two-player') {
+      handleInput(p2, false);
     }
-    if (gameMode === 'online-host') applyRemoteInput();
-    handleInput(p2, false);
-    updatePhysics(p1);
-    updatePhysics(p2);
-    updateGrapple(p1, p2);
-    updateGrapple(p2, p1);
-    handleCombat(p1, p2);
-    handleCombat(p2, p1);
+    for (const fighter of fighters) updatePhysics(fighter);
+    for (const fighter of fighters) updateGrapple(fighter);
+    for (const fighter of fighters) {
+      handleCombat(fighter, fighters.filter((target) => target !== fighter));
+    }
     updateProjectiles();
-    checkBlastZones(p1, true);
-    checkBlastZones(p2, false);
+    fighters.forEach((fighter, index) => checkBlastZones(fighter, index));
     percent1.textContent = Math.round(p1.percent) + '%';
     percent2.textContent = Math.round(p2.percent) + '%';
+    updateStockUI();
     sendOnlineState();
   }
   render();
@@ -5866,12 +6129,17 @@ function gameLoop() {
 function getKeyboardKey(event) {
   if (event.code === 'Space') return 'space';
   if (event.code === 'ShiftRight') return 'rshift';
+  if (event.code === 'KeyA') return 'a';
+  if (event.code === 'KeyD') return 'd';
+  if (event.code === 'KeyW') return 'w';
+  if (event.code === 'KeyS') return 's';
+  if (event.code === 'KeyF') return 'f';
+  if (event.code === 'KeyG') return 'g';
   return event.key.toLowerCase();
 }
 
 const ONLINE_GUEST_KEYS = [
-  'j', 'l', 'i', 'k', 'o', 'p', 'rshift',
-  'arrowleft', 'arrowright', 'arrowup', 'arrowdown'
+  'a', 'd', 'w', 's', 'f', 'g', 'space'
 ];
 
 window.addEventListener('keydown', (e) => {
@@ -5879,13 +6147,13 @@ window.addEventListener('keydown', (e) => {
   const key = getKeyboardKey(e);
   const alreadyPressed = keys[key];
   keys[key] = true;
-  if (gameMode === 'online-guest' && gameRunning &&
+  if (online.role === 'guest' && gameRunning &&
       ONLINE_GUEST_KEYS.includes(key)) {
     if (!alreadyPressed) sendOnlineInput();
     e.preventDefault();
     return;
   }
-  if (gameRunning && (key === 'space' || key === 'rshift')) e.preventDefault();
+  if (gameRunning && (ONLINE_GUEST_KEYS.includes(key) || key === 'rshift')) e.preventDefault();
   if (!winScreen.hidden) {
     if (e.key === 'Enter' || e.key === 'Escape') {
       e.preventDefault();
@@ -5908,17 +6176,17 @@ window.addEventListener('keydown', (e) => {
     handleStageSelectKeydown(e);
     return;
   }
-});
+}, true);
 
 window.addEventListener('keyup', (e) => {
   const key = getKeyboardKey(e);
   keys[key] = false;
-  if (gameMode === 'online-guest' && gameRunning &&
+  if (online.role === 'guest' && gameRunning &&
       ONLINE_GUEST_KEYS.includes(key)) {
     sendOnlineInput();
     e.preventDefault();
   }
-});
+}, true);
 
 window.addEventListener('blur', () => {
   for (const key of [
@@ -5933,4 +6201,5 @@ window.addEventListener('blur', () => {
 });
 
 updateStockUI();
+startOnlineInputHeartbeat();
 requestAnimationFrame(gameLoop);

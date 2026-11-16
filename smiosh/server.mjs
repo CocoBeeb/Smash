@@ -15,7 +15,7 @@ const STATIC_FILES = new Map([
   ['/smoish.js', ['smoish.js', 'text/javascript; charset=utf-8']],
   ['/smoish.css', ['smoish.css', 'text/css; charset=utf-8']]
 ]);
-const INPUT_KEYS = ['j', 'l', 'i', 'k', 'o', 'p', 'rshift'];
+const INPUT_KEYS = ['a', 'd', 'w', 's', 'f', 'g', 'space'];
 
 function createRoomCode() {
   return Array.from({ length: ROOM_CODE_LENGTH }, () =>
@@ -33,6 +33,11 @@ function isFighterId(value) {
   return typeof value === 'string' && /^[a-z0-9-]{1,48}$/.test(value);
 }
 
+function isPlayerName(value) {
+  return typeof value === 'string' && value.trim() === value &&
+    value.length > 0 && value.length <= 16 && !/[\u0000-\u001f\u007f]/.test(value);
+}
+
 function isInputState(value) {
   return value && typeof value === 'object' && !Array.isArray(value) &&
     Object.keys(value).every((key) => INPUT_KEYS.includes(key)) &&
@@ -41,6 +46,22 @@ function isInputState(value) {
 
 function replyError(socket, message) {
   send(socket, { type: 'error', message });
+}
+
+function getRoomMembers(room) {
+  return [...room.members.values()].map(({ id, name, fighterId, ready, fighting }) => ({
+    id,
+    name,
+    fighterId,
+    ready,
+    fighting
+  }));
+}
+
+function broadcastRoom(room, message, except = null) {
+  for (const member of room.members.values()) {
+    if (member.socket !== except) send(member.socket, message);
+  }
 }
 
 export function createGameServer() {
@@ -157,16 +178,35 @@ export function createGameServer() {
       const connection = connections.get(socket);
       if (!connection) {
         if (message.type === 'create-room') {
+          if (!isPlayerName(message.name)) {
+            replyError(socket, 'Enter a name between 1 and 16 characters.');
+            return;
+          }
           let roomCode = createRoomCode();
           while (rooms.has(roomCode)) roomCode = createRoomCode();
-          const room = { host: socket, guest: null };
+          const room = {
+            host: socket,
+            matchSetup: null,
+            members: new Map([['host', {
+              id: 'host',
+              name: message.name,
+              socket,
+              fighterId: null,
+              ready: false,
+              fighting: true
+            }]])
+          };
           rooms.set(roomCode, room);
-          connections.set(socket, { roomCode, role: 'host' });
+          connections.set(socket, { roomCode, role: 'host', playerId: 'host' });
           send(socket, { type: 'created', roomCode });
           return;
         }
 
         if (message.type === 'join-room') {
+          if (!isPlayerName(message.name)) {
+            replyError(socket, 'Enter a name between 1 and 16 characters.');
+            return;
+          }
           if (typeof message.roomCode !== 'string' ||
               !new RegExp(`^[${ROOM_ALPHABET}]{${ROOM_CODE_LENGTH}}$`).test(message.roomCode)) {
             replyError(socket, 'Enter a valid room code.');
@@ -177,14 +217,29 @@ export function createGameServer() {
             replyError(socket, 'Room not found. Check the code and try again.');
             return;
           }
-          if (room.guest) {
-            replyError(socket, 'That room already has two players.');
+          const playerId = randomInt(1, 0x7fffffff).toString(36);
+          while (room.members.has(playerId)) {
+            replyError(socket, 'Could not assign a room player ID. Please try again.');
             return;
           }
-          room.guest = socket;
-          connections.set(socket, { roomCode: message.roomCode, role: 'guest' });
-          send(socket, { type: 'joined', roomCode: message.roomCode });
-          send(room.host, { type: 'peer-joined' });
+          room.members.set(playerId, {
+            id: playerId,
+            name: message.name,
+            socket,
+            fighterId: null,
+            ready: false,
+            fighting: false
+          });
+          connections.set(socket, { roomCode: message.roomCode, role: 'guest', playerId });
+          send(socket, {
+            type: 'joined',
+            roomCode: message.roomCode,
+            playerId,
+            inProgress: Boolean(room.matchSetup),
+            members: getRoomMembers(room)
+          });
+          if (room.matchSetup) send(socket, room.matchSetup);
+          broadcastRoom(room, { type: 'room-members', members: getRoomMembers(room) }, socket);
           return;
         }
 
@@ -201,37 +256,59 @@ export function createGameServer() {
 
       if (connection.role === 'host') {
         if (message.type === 'host-selection' &&
-            isFighterId(message.fighterId) && typeof message.ready === 'boolean') {
-          send(room.guest, message);
+            isFighterId(message.fighterId) && typeof message.ready === 'boolean' &&
+            typeof message.fighting === 'boolean') {
+          const member = room.members.get('host');
+          member.fighterId = message.fighterId;
+          member.ready = message.ready;
+          member.fighting = message.fighting;
+          broadcastRoom(room, { type: 'room-members', members: getRoomMembers(room) });
           return;
         }
         if (message.type === 'start' &&
-            isFighterId(message.fighter1) && isFighterId(message.fighter2) &&
-            isFighterId(message.stageId)) {
-          send(room.guest, message);
+            Array.isArray(message.players) && message.players.length >= 2 &&
+            message.players.length <= room.members.size &&
+            message.players.length === [...room.members.values()]
+              .filter((member) => member.fighting).length &&
+            isFighterId(message.stageId) &&
+            message.players.every((player) => {
+              const member = room.members.get(player?.id);
+              return member && member.fighting && member.ready && isPlayerName(player.name) &&
+                member.name === player.name &&
+                member.fighterId === player.fighterId && isFighterId(player.fighterId);
+            }) &&
+            new Set(message.players.map((player) => player.id)).size === message.players.length) {
+          room.matchSetup = message;
+          broadcastRoom(room, message, socket);
           return;
         }
         if (message.type === 'state' && message.state &&
             typeof message.state === 'object' && !Array.isArray(message.state)) {
-          send(room.guest, message);
+          broadcastRoom(room, message, socket);
           return;
         }
         if (message.type === 'game-over' &&
             isFighterId(message.winner?.char) &&
-            (message.playerNumber === 1 || message.playerNumber === 2) &&
+            Number.isInteger(message.playerNumber) && message.playerNumber >= 1 &&
             message.state && typeof message.state === 'object' &&
             message.state.gameRunning === false) {
-          send(room.guest, message);
+          room.matchSetup = null;
+          broadcastRoom(room, message, socket);
           return;
         }
       } else {
         if (message.type === 'selection' &&
-            isFighterId(message.fighterId) && typeof message.ready === 'boolean') {
-          send(room.host, message);
+            isFighterId(message.fighterId) && typeof message.ready === 'boolean' &&
+            typeof message.fighting === 'boolean') {
+          const member = room.members.get(connection.playerId);
+          member.fighterId = message.fighterId;
+          member.ready = message.ready;
+          member.fighting = message.fighting;
+          broadcastRoom(room, { type: 'room-members', members: getRoomMembers(room) });
           return;
         }
         if (message.type === 'input' && isInputState(message.keys)) {
-          send(room.host, message);
+          send(room.host, { ...message, playerId: connection.playerId });
           return;
         }
       }
@@ -247,12 +324,15 @@ export function createGameServer() {
       if (!room) return;
       if (connection.role === 'host') {
         rooms.delete(connection.roomCode);
-        send(room.guest, { type: 'peer-left' });
-        room.guest?.close(1000, 'Host left the room');
-        if (room.guest) connections.delete(room.guest);
+        broadcastRoom(room, { type: 'peer-left' }, socket);
+        for (const member of room.members.values()) {
+          if (member.socket === socket) continue;
+          connections.delete(member.socket);
+          member.socket.close(1000, 'Host left the room');
+        }
       } else {
-        room.guest = null;
-        send(room.host, { type: 'peer-left' });
+        room.members.delete(connection.playerId);
+        broadcastRoom(room, { type: 'room-members', members: getRoomMembers(room) });
       }
     });
   });

@@ -843,7 +843,7 @@ let p1 = makeFighter(initialSpawns[0].x, initialSpawns[0].y, 1, 'jigglypuff');
 let p2 = makeFighter(initialSpawns[1].x, initialSpawns[1].y, -1, 'steve');
 fighters = [p1, p2];
 
-const TIER_ORDER = ['S', 'A', 'B', 'C', 'D', 'NEW'];
+const TIER_ORDER = ['S', 'A', 'B', 'C', 'D', 'Unranked'];
 const TIER_SIMULATION_MATCHES = 23008;
 const TIER_SIMULATION_PAIRS = 11504;
 const TIER_SIMULATION_TIMEOUTS = 9156;

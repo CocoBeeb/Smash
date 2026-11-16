@@ -24,11 +24,12 @@
             <div class="stocks" id="stocks1"></div>
           </div>
           <div class="percent-val" id="percent1">0%</div>
-          <div class="hint-pill">WASD + F (Atk) / G (Spec)</div>
+          <div class="hint-pill" id="p1-hint">WASD move · Space jump · F attack · G special</div>
         </div>
       </div>
 
       <div id="match-banner"></div>
+      <div id="multiplayer-hud" aria-live="polite"></div>
 
       <section id="win-screen" aria-labelledby="winner-title" hidden>
         <div class="win-card">
@@ -49,7 +50,7 @@
             <span class="fighter-label">STEVE</span>
           </div>
           <div class="percent-val" id="percent2">0%</div>
-          <div class="hint-pill" id="p2-hint">IJKL + O (Atk) / P (Spec)</div>
+          <div class="hint-pill" id="p2-hint">IJKL / arrows · Right Shift jump · O attack · P special</div>
         </div>
         <div class="fighter-avatar avatar-steve"></div>
       </div>
@@ -73,16 +74,23 @@
           <button type="button" class="game-mode-button" data-game-mode="online-guest" aria-pressed="false">Join Online</button>
         </div>
         <div id="online-controls" class="online-controls" hidden>
+          <label for="online-player-name">Your name</label>
+          <input id="online-player-name" type="text" maxlength="16" autocomplete="nickname" />
           <div id="online-host-controls" hidden>
             <button id="create-online-room" type="button">Create Invite Room</button>
-            <p>Share the room code with one friend. You control Player 1.</p>
+            <p>Share the room code. Choose whether to fight or spectate.</p>
           </div>
           <div id="online-guest-controls" hidden>
             <label for="online-room-code">Room code</label>
             <input id="online-room-code" type="text" maxlength="8" autocomplete="off" spellcheck="false" />
             <button id="join-online-room" type="button">Join Room</button>
-            <p>You control Player 2.</p>
+            <label id="online-fight-label" hidden>
+              <input id="online-fight" type="checkbox" checked />
+              Join the fight (uncheck to spectate)
+            </label>
           </div>
+          <p id="online-room-code-display" hidden></p>
+          <p id="online-members" aria-live="polite"></p>
           <p id="online-status" role="status" aria-live="polite"></p>
         </div>
         <input id="character-search" type="search" placeholder="Search all fighters..." aria-label="Search fighters" />
@@ -96,7 +104,7 @@
                 <span id="p1-selection-status" aria-live="polite">Choose a fighter</span>
               </div>
             </div>
-            <p>WASD move · F lock · G unlock</p>
+            <p>WASD move · W aim up · Space jump · F lock · G unlock</p>
             <button id="lock-p1" type="button">Lock In (F)</button>
           </div>
           <div class="select-player p2-player">
@@ -107,7 +115,7 @@
                 <span id="p2-selection-status" aria-live="polite">Choose a fighter</span>
               </div>
             </div>
-            <p id="p2-selection-help">IJKL / arrows move · O lock · P unlock</p>
+            <p id="p2-selection-help">IJKL / arrows move · I aim up · Right Shift jump · O lock · P unlock</p>
             <button id="select-cpu-fighter" type="button" hidden>Choose CPU Fighter</button>
             <button id="lock-p2" type="button">Lock In (O)</button>
           </div>
